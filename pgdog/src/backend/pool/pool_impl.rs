@@ -19,6 +19,7 @@ use crate::net::{
     messages::{BackendPid, FrontendPid},
 };
 
+use super::cancels::DeferredCheckIn;
 use super::inner::CheckInResult;
 use super::{
     Address, Comms, Config, Error, Guard, Healtcheck, Inner, Monitor, Oids, PoolConfig, Request,
@@ -50,6 +51,19 @@ pub(crate) struct InnerSync {
     pub(super) lsn_stats: RwLock<LsnStats>,
     pub(super) lsn_role_change: Notify,
     pub(super) oids: Arc<Oids>,
+}
+
+/// Cancel request sent by [`Pool::cancel`]. Releases the server
+/// held for it when dropped.
+struct CancelInFlight<'a> {
+    pool: &'a Pool,
+    backend: BackendPid,
+}
+
+impl Drop for CancelInFlight<'_> {
+    fn drop(&mut self) {
+        self.pool.finish_cancel(self.backend);
+    }
 }
 
 impl std::fmt::Debug for Pool {
@@ -274,10 +288,18 @@ impl Pool {
 
         // Check everything and maybe check the connection
         // into the idle pool.
+        let result = { self.lock().maybe_check_in(server, now, counts, false)? };
+        self.checked_in(result);
+
+        Ok(())
+    }
+
+    /// Act on the result of a connection check-in.
+    fn checked_in(&self, result: CheckInResult) {
         let CheckInResult {
             server_error,
             replenish,
-        } = { self.lock().maybe_check_in(server, now, counts, false)? };
+        } = result;
 
         if server_error {
             error!(
@@ -292,18 +314,55 @@ impl Pool {
         if replenish {
             self.comms().request.notify_one();
         }
+    }
+
+    /// Send a cancellation request if the client is connected to a server.
+    ///
+    /// Until Postgres has processed it, the server isn't given to another
+    /// client, so the cancel can only reach a query from this client.
+    pub(crate) async fn cancel(&self, id: FrontendPid) -> Result<(), super::super::Error> {
+        // Must NOT hold the lock while doing async I/O.
+        let Some((backend, key)) = self.lock().start_cancel(id) else {
+            return Ok(());
+        };
+
+        // Releases the server even if this future is dropped.
+        let _in_flight = CancelInFlight {
+            pool: self,
+            backend,
+        };
+
+        safe_timeout(
+            self.config().connect_timeout,
+            Server::cancel(self.addr(), key),
+        )
+        .await
+        .map_err(|_| Error::ConnectTimeout)??;
 
         Ok(())
     }
 
-    /// Send a cancellation request if the client is connected to a server.
-    pub(crate) async fn cancel(&self, id: FrontendPid) -> Result<(), super::super::Error> {
-        // Must NOT hold the lock while doing async I/O.
-        let key = self.lock().cancel_key(id).cloned();
-        if let Some(key) = key {
-            Server::cancel(self.addr(), key).await?;
+    /// Cancel request for this server is done. Check it in
+    /// if the client returned it while the cancel was in flight.
+    fn finish_cancel(&self, backend: BackendPid) {
+        let result = {
+            let mut guard = self.lock();
+            let Some(DeferredCheckIn {
+                server,
+                now,
+                stats,
+                moving,
+            }) = guard.finish_cancel(backend)
+            else {
+                return;
+            };
+            guard.maybe_check_in(server, now, stats, moving)
+        };
+
+        match result {
+            Ok(result) => self.checked_in(result),
+            Err(err) => error!("pool checkin error: {} [{}]", err, self.addr()),
         }
-        Ok(())
     }
 
     /// Connection pool unique identifier.

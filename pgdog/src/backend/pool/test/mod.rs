@@ -1312,3 +1312,92 @@ fn test_reset_stats_clears_cumulative_statistics() {
     assert_eq!(state.out_of_sync, 0);
     assert_eq!(state.force_close, 0);
 }
+
+/// Regression for #1505: in transaction mode, a cancel request in flight for
+/// client A must not reach the query of client B that gets A's server next.
+#[tokio::test]
+async fn test_cancel_in_flight_holds_server() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    use crate::backend::server::test::test_server;
+    use crate::net::{Startup, ToBytes};
+
+    // Stands in for the postmaster: accepts cancel requests and
+    // closes the connection when the test says so.
+    let postmaster = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let pool = Pool::new(&PoolConfig {
+        address: Address {
+            host: "127.0.0.1".into(),
+            port: postmaster.local_addr().unwrap().port(),
+            database_name: "pgdog".into(),
+            user: "pgdog".into(),
+            passwords: vec!["pgdog".into()],
+            ..Default::default()
+        },
+        config: Config {
+            max: 1,
+            min: 0,
+            ..Config::default()
+        },
+    });
+
+    // Not launched, so the pool won't connect to the fake postmaster.
+    // Give it a real server connection instead.
+    let server = Box::new(test_server().await);
+    {
+        let mut guard = pool.lock();
+        guard.online = true;
+        guard.put(server, Instant::now()).unwrap();
+    }
+
+    let client_a = Request::default();
+    let guard_a = pool.get(&client_a).await.unwrap();
+    let backend = guard_a.id();
+    let key = guard_a.key().clone();
+
+    let cancel = spawn({
+        let pool = pool.clone();
+        async move { pool.cancel(client_a.id).await }
+    });
+
+    let (mut conn, _) = postmaster.accept().await.unwrap();
+    let expected = Startup::Cancel { id: key }.to_bytes();
+    let mut request = vec![0; expected.len()];
+    conn.read_exact(&mut request).await.unwrap();
+    assert_eq!(request, expected);
+
+    // A's transaction finishes while the cancel is in flight.
+    drop(guard_a);
+
+    let client_b = spawn({
+        let pool = pool.clone();
+        async move { pool.get(&Request::default()).await }
+    });
+
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !cancel.is_finished(),
+        "cancel must wait for the postmaster to close the connection"
+    );
+    assert!(
+        !client_b.is_finished(),
+        "server must not be given to another client while a cancel is in flight"
+    );
+    assert_eq!(pool.lock().idle(), 0);
+
+    // Postmaster signalled the backend.
+    drop(conn);
+    cancel.await.unwrap().unwrap();
+
+    let guard_b = timeout(Duration::from_secs(1), client_b)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(guard_b.id(), backend);
+
+    // A's late cancel requests don't find a server anymore.
+    pool.cancel(client_a.id).await.unwrap();
+}

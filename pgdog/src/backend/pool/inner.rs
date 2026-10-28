@@ -13,6 +13,7 @@ use pgdog_config::Role;
 use pgdog_stats::RoleSpecificConfig;
 use tokio::time::Instant;
 
+use super::cancels::{Cancels, DeferredCheckIn};
 use super::{Config, Error, Pool, Request, Stats, Taken, Waiter, lsn_monitor::ReplicaLag};
 
 /// Pool internals protected by a mutex.
@@ -23,6 +24,8 @@ pub(super) struct Inner {
     idle_connections: Vec<Box<Server>>,
     /// Server connections currently checked out.
     taken: Taken,
+    /// Server connections with a cancel request in flight.
+    cancels: Cancels,
     /// Pool configuration.
     pub(super) config: Config,
     /// Number of clients waiting for a connection.
@@ -74,6 +77,7 @@ impl Inner {
         Self {
             idle_connections: Vec::new(),
             taken: Taken::default(),
+            cancels: Cancels::default(),
             config,
             waiting: VecDeque::new(),
             online: false,
@@ -128,8 +132,32 @@ impl Inner {
     }
 
     /// Cancel key for the server currently assigned to this client.
+    #[cfg(test)]
     pub(super) fn cancel_key(&self, client: FrontendPid) -> Option<&BackendKeyData> {
         self.taken.cancel_key(client)
+    }
+
+    /// Start a cancel request for the server currently assigned to this client.
+    ///
+    /// The server won't be given to another client until [`Self::finish_cancel`]
+    /// is called for it.
+    pub(super) fn start_cancel(
+        &mut self,
+        client: FrontendPid,
+    ) -> Option<(BackendPid, BackendKeyData)> {
+        let (backend, key) = self.taken.checkout(client)?;
+
+        if self.cancels.start(backend) {
+            Some((backend, key.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Cancel request for this server is done. Returns its check-in,
+    /// if it was deferred and no other cancel request is in flight.
+    pub(super) fn finish_cancel(&mut self, backend: BackendPid) -> Option<DeferredCheckIn> {
+        self.cancels.finish(backend)
     }
 
     /// All cancel keys for currently checked-out server connections.
@@ -350,6 +378,20 @@ impl Inner {
             server_error: false,
             replenish: true,
         };
+
+        // A cancel request for this server is in flight. Don't give the server
+        // to another client until Postgres has processed it, or it could
+        // cancel that client's query instead.
+        if self.cancels.in_flight(server.id()) {
+            self.cancels.defer(DeferredCheckIn {
+                server,
+                now,
+                stats,
+                moving,
+            });
+            result.replenish = false;
+            return Ok(result);
+        }
 
         if let Some(ref moved) = self.moved {
             result.replenish = false;
@@ -841,6 +883,61 @@ mod test {
         inner.taken.take(client_id, server_id, cancel_key.clone());
 
         assert_eq!(inner.cancel_key(client_id), Some(&cancel_key));
+    }
+
+    #[test]
+    fn test_check_in_deferred_while_cancel_in_flight() {
+        let mut inner = Inner {
+            online: true,
+            ..Default::default()
+        };
+        let client_a = FrontendPid::new();
+        let server = Box::new(Server::default());
+        let backend = server.id();
+        let key = server.key().clone();
+        inner.taken.take(client_a, backend, key.clone());
+
+        // Client B is waiting for a connection.
+        let (tx, mut rx) = channel();
+        inner.waiting.push_back(Waiter {
+            request: Request::default(),
+            tx,
+        });
+
+        assert_eq!(inner.start_cancel(client_a), Some((backend, key.clone())));
+        assert_eq!(inner.start_cancel(client_a), Some((backend, key)));
+
+        // Client A finishes its transaction while the cancels are in flight.
+        let result = inner
+            .maybe_check_in(server, Instant::now(), BackendCounts::default(), false)
+            .unwrap();
+        assert!(!result.server_error);
+        assert!(!result.replenish);
+
+        // B doesn't get the server, and it's still counted as checked out.
+        assert!(rx.try_recv().is_err());
+        assert_eq!(inner.waiting.len(), 1);
+        assert_eq!(inner.checked_out(), 1);
+        assert_eq!(inner.idle(), 0);
+
+        // A has nothing running, a new cancel request is a no-op.
+        assert_eq!(inner.start_cancel(client_a), None);
+
+        assert!(inner.finish_cancel(backend).is_none());
+        let DeferredCheckIn {
+            server,
+            now,
+            stats,
+            moving,
+        } = inner
+            .finish_cancel(backend)
+            .expect("last cancel releases the check-in");
+        inner.maybe_check_in(server, now, stats, moving).unwrap();
+
+        // Now B gets it.
+        assert_eq!(rx.try_recv().unwrap().unwrap().id(), backend);
+        assert_eq!(inner.checked_out(), 1);
+        assert_eq!(inner.cancel_key(client_a), None);
     }
 
     #[test]

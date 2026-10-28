@@ -455,10 +455,18 @@ impl Server {
     }
 
     /// Request query cancellation for the given backend server identifier.
+    ///
+    /// Returns once Postgres has processed the request, so the cancel
+    /// can't reach a query sent after this returns.
     pub(crate) async fn cancel(addr: &Address, id: BackendKeyData) -> Result<(), Error> {
         let mut stream = TcpStream::connect(addr.addr().await?).await?;
         stream.write_all(&Startup::Cancel { id }.to_bytes()).await?;
         stream.flush().await?;
+
+        // Postgres closes the connection after it signals the backend.
+        // Wait for that, like libpq does. It doesn't send any data,
+        // and errors mean the connection is gone, which is just as good.
+        let _ = stream.read(&mut [0u8; 1]).await;
 
         Ok(())
     }

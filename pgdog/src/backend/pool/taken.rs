@@ -78,7 +78,15 @@ impl Taken {
         self.backend_to_frontend.is_empty()
     }
 
+    /// Backend connection and its cancel key for this frontend's current checkout.
+    pub(super) fn checkout(&self, frontend: FrontendPid) -> Option<(BackendPid, &BackendKeyData)> {
+        self.frontend_to_cancel
+            .get(&frontend)
+            .map(|c| (c.backend, &c.key))
+    }
+
     /// Backend cancel key for this frontend's current checkout.
+    #[cfg(test)]
     pub(super) fn cancel_key(&self, frontend: FrontendPid) -> Option<&BackendKeyData> {
         self.frontend_to_cancel.get(&frontend).map(|c| &c.key)
     }
