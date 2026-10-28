@@ -1,6 +1,6 @@
 use crate::{
     backend::pool::{Connection, Request},
-    config::config,
+    config::{PreparedStatementsLevel, config},
     frontend::{
         BufferedQuery, Client, ClientComms, ClientRequest, Command, DiscardTarget, Error, Router,
         RouterContext, Stats,
@@ -131,6 +131,18 @@ impl QueryEngine {
     /// Current state.
     pub(crate) fn client_state(&self) -> State {
         self.stats.state
+    }
+
+    /// Prepared statements level for the cluster this client is connected to.
+    ///
+    /// Uses the cluster's pooler mode, which can be overridden per user or database.
+    pub(crate) fn prepared_statements(&self) -> PreparedStatementsLevel {
+        let config = config();
+        match self.backend.cluster() {
+            Ok(cluster) => config.prepared_statements_for(cluster.pooler_mode()),
+            // Admin database doesn't have a cluster.
+            Err(_) => config.prepared_statements(),
+        }
     }
 
     /// Handle client request.

@@ -168,10 +168,18 @@ impl ConfigAndUsers {
         Ok(())
     }
 
-    /// Prepared statements are enabled.
+    /// Prepared statements are enabled, using the `[general]` pooler mode.
     pub fn prepared_statements(&self) -> PreparedStatementsLevel {
+        self.prepared_statements_for(self.config.general.pooler_mode)
+    }
+
+    /// Prepared statements level for a pool running in the given pooler mode.
+    ///
+    /// The pooler mode can be overridden per user or database, so pass the
+    /// mode the pool actually uses, not `[general] pooler_mode`.
+    pub fn prepared_statements_for(&self, pooler_mode: PoolerMode) -> PreparedStatementsLevel {
         // Disable prepared statements automatically in session mode
-        if self.config.general.pooler_mode == PoolerMode::Session {
+        if pooler_mode == PoolerMode::Session {
             PreparedStatementsLevel::Disabled
         } else {
             self.config.general.prepared_statements
@@ -1029,6 +1037,37 @@ tls_server_private_key = "/certs/replica-client.key"
             config.prepared_statements(),
             PreparedStatementsLevel::Disabled,
             "Prepared statements should remain disabled when explicitly set to Disabled in transaction mode"
+        );
+    }
+
+    #[test]
+    fn test_prepared_statements_for_overridden_pooler_mode() {
+        let mut config = ConfigAndUsers::default();
+        config.config.general.prepared_statements = PreparedStatementsLevel::Extended;
+
+        // [general] is session, but the pool runs in transaction mode (per-user override).
+        config.config.general.pooler_mode = PoolerMode::Session;
+        assert_eq!(
+            config.prepared_statements_for(PoolerMode::Transaction),
+            PreparedStatementsLevel::Extended
+        );
+        assert_eq!(
+            config.prepared_statements_for(PoolerMode::Statement),
+            PreparedStatementsLevel::Extended
+        );
+
+        // [general] is transaction, but the pool runs in session mode.
+        config.config.general.pooler_mode = PoolerMode::Transaction;
+        assert_eq!(
+            config.prepared_statements_for(PoolerMode::Session),
+            PreparedStatementsLevel::Disabled
+        );
+
+        // Explicitly disabled stays disabled in any mode.
+        config.config.general.prepared_statements = PreparedStatementsLevel::Disabled;
+        assert_eq!(
+            config.prepared_statements_for(PoolerMode::Transaction),
+            PreparedStatementsLevel::Disabled
         );
     }
 

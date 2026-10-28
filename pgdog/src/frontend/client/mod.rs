@@ -636,6 +636,9 @@ impl Client {
         use query_engine::{Pipeline, QueryEngineContext, QueryEngineResult};
         self.check_maintenance_mode(query_engine).await;
 
+        // Configure prepared statements cache for this client's cluster.
+        self.prepared_statements.level = query_engine.prepared_statements();
+
         let (mut context, client_request) = QueryEngineContext::new(self);
         match query_engine.handle(&mut context, client_request).await? {
             QueryEngineResult::Done(transaction) => self.transaction = transaction,
@@ -685,8 +688,6 @@ impl Client {
 
         // Check config once per request.
         let config = config::config();
-        // Configure prepared statements cache.
-        self.prepared_statements.level = config.prepared_statements();
         self.timeouts = Timeouts::from_config(&config.config.general);
         self.query_log_stdout = config.config.general.query_log_stdout;
         self.query_size_limit = config.config.general.query_size_limit;

@@ -30,6 +30,7 @@ mod multi_statement;
 mod omni;
 mod pipeline_execution;
 pub(crate) mod prelude;
+mod prepared_pooler_mode;
 mod prepared_syntax_error;
 mod pub_sub;
 mod regression_auto_two_pc;
