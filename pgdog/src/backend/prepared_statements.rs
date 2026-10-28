@@ -316,8 +316,15 @@ impl PreparedStatements {
 
                 if !parse.anonymous() {
                     if self.contains(parse.name()) {
-                        // TODO(lev): perform the same in errored transaction check
-                        // as we do for PREPARE below.
+                        if self.server_state == State::TransactionError {
+                            // Let Postgres decide if this Parse is allowed in the aborted
+                            // transaction: it returns 25P02 unless the statement ends the
+                            // transaction, e.g. ROLLBACK. Send it unnamed so the statement
+                            // already prepared under this name is left alone.
+                            parse.anonymize();
+                            self.state.add('1');
+                            return Ok(HandleResult::Rewrite(ProtocolMessage::Parse(parse)));
+                        }
                         self.state.add_simulated(ParseComplete.message());
                         return Ok(HandleResult::Drop);
                     } else {
@@ -1258,6 +1265,53 @@ pub(crate) mod test {
         let result = ps.handle(&ProtocolMessage::Parse(parse)).unwrap();
         // contains() returns true so Drop is returned before the rewrite_anonymous check.
         assert!(matches!(result, HandleResult::Drop));
+    }
+
+    #[test]
+    fn parse_already_prepared_in_failed_transaction_is_sent_unnamed() {
+        let mut ps = new_extended();
+        ps.prepared("stmt1");
+        ps.set_server_state(State::TransactionError);
+
+        let parse = Parse::named("stmt1", "SELECT 1");
+        let result = ps.handle(&ProtocolMessage::Parse(parse)).unwrap();
+        match result {
+            HandleResult::Rewrite(ProtocolMessage::Parse(p)) => {
+                assert!(p.anonymous(), "Parse should be anonymized");
+                assert_eq!(p.query(), "SELECT 1");
+            }
+            other => panic!("expected Rewrite(Parse), got {:?}", other),
+        }
+        ps.handle(&ProtocolMessage::Sync(Sync)).unwrap();
+
+        // Postgres rejects the Parse with 25P02; the client gets the error, not a ParseComplete.
+        let mut error = ErrorResponse::in_failed_transaction().message();
+        assert!(ps.forward(&mut error).unwrap());
+        let mut rfq = ReadyForQuery::error().message();
+        assert!(ps.forward(&mut rfq).unwrap());
+
+        assert!(ps.done());
+        assert!(ps.contains("stmt1"));
+    }
+
+    #[test]
+    fn parse_already_prepared_in_failed_transaction_forwards_parse_complete() {
+        let mut ps = new_extended();
+        ps.prepared("stmt1");
+        ps.set_server_state(State::TransactionError);
+
+        // ROLLBACK is allowed in an aborted transaction, so Postgres replies with ParseComplete.
+        let parse = Parse::named("stmt1", "ROLLBACK");
+        ps.handle(&ProtocolMessage::Parse(parse)).unwrap();
+        ps.handle(&ProtocolMessage::Sync(Sync)).unwrap();
+
+        let mut parse_complete = ParseComplete.message();
+        assert!(ps.forward(&mut parse_complete).unwrap());
+        let mut rfq = ReadyForQuery::error().message();
+        assert!(ps.forward(&mut rfq).unwrap());
+
+        assert!(ps.done());
+        assert!(ps.contains("stmt1"));
     }
 
     // -------------------------------------------------------

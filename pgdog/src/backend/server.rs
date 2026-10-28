@@ -4497,6 +4497,87 @@ pub(crate) mod test {
         }
     }
 
+    #[tokio::test]
+    async fn test_parse_in_transaction_error() {
+        let mut server = test_server().await;
+        let parse = Parse::named("__test_parse_aborted", "SELECT $1");
+
+        server
+            .send(&vec![ProtocolMessage::from(parse.clone()), Sync.into()].into())
+            .await
+            .unwrap();
+        for c in ['1', 'Z'] {
+            assert_eq!(server.read().await.unwrap().code(), c);
+        }
+
+        server.execute("BEGIN").await.unwrap();
+        let _ = server.execute("SELECT 1/0").await;
+
+        for _ in 0..3 {
+            server
+                .send(
+                    &vec![
+                        ProtocolMessage::from(parse.clone()),
+                        Bind::new_statement("__test_parse_aborted").into(),
+                        Execute::new().into(),
+                        Sync.into(),
+                    ]
+                    .into(),
+                )
+                .await
+                .unwrap();
+
+            let err = ErrorResponse::try_from(server.read().await.unwrap()).unwrap();
+            assert_eq!(err.code, "25P02");
+
+            let rfq = ReadyForQuery::try_from(server.read().await.unwrap()).unwrap();
+            assert!(rfq.is_transaction_aborted());
+            assert!(server.prepared_statements.contains("__test_parse_aborted"));
+        }
+
+        server.execute("ROLLBACK").await.unwrap();
+        assert!(server.prepared_statements.contains("__test_parse_aborted"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_rollback_in_transaction_error() {
+        let mut server = test_server().await;
+        let parse = Parse::named("__test_parse_aborted_rollback", "ROLLBACK");
+
+        server
+            .send(&vec![ProtocolMessage::from(parse.clone()), Sync.into()].into())
+            .await
+            .unwrap();
+        for c in ['1', 'Z'] {
+            assert_eq!(server.read().await.unwrap().code(), c);
+        }
+
+        server.execute("BEGIN").await.unwrap();
+        let _ = server.execute("SELECT 1/0").await;
+
+        // ROLLBACK can be parsed in an aborted transaction.
+        server
+            .send(
+                &vec![
+                    ProtocolMessage::from(parse),
+                    Bind::new_statement("__test_parse_aborted_rollback").into(),
+                    Execute::new().into(),
+                    Sync.into(),
+                ]
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        for c in ['1', '2', 'C'] {
+            assert_eq!(server.read().await.unwrap().code(), c);
+        }
+        let rfq = server.read().await.unwrap();
+        assert_eq!(rfq.code(), 'Z');
+        assert!(!rfq.in_transaction());
+        assert!(server.done());
+    }
+
     #[test]
     fn test_effective_max_age_default_is_base() {
         let server = Server::default();
